@@ -1,0 +1,599 @@
+# ربات مدیریت فایل تلگرام - فقط برای ادمین‌ها
+import logging
+import json
+import os
+import hashlib
+from datetime import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler, ConversationHandler
+import asyncio
+
+# تنظیم لاگ
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+    handlers=[
+        logging.FileHandler('bot.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# تنظیمات ربات
+BOT_TOKEN = "8186060654:AAE_uYgaGEDaTwgkyz8ruFJboTXshPd-6qQ"  # توکن ربات از @BotFather
+ADMIN_IDS = [8048628136]  # آیدی ادمین‌ها را اینجا قرار دهید
+FILES_DIR = "uploaded_files"  # پوشه ذخیره فایل‌ها
+FILES_DB = "files_database.json"  # فایل دیتابیس
+USERS_DB = "/content/drive/MyDrive/sepi_bot/users.json" # مسیر فایل دیتابیس کاربران
+
+# ایجاد پوشه فایل‌ها
+os.makedirs(FILES_DIR, exist_ok=True)
+
+class FileManager:
+    def __init__(self):
+        self.files_db = self.load_files_db()
+        self.users_db = self.load_users_db()
+
+    def load_files_db(self):
+        """بارگذاری دیتابیس فایل‌ها"""
+        try:
+            with open(FILES_DB, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return {}
+
+    def save_files_db(self):
+        """ذخیره دیتابیس فایل‌ها"""
+        with open(FILES_DB, 'w', encoding='utf-8') as f:
+            json.dump(self.files_db, f, ensure_ascii=False, indent=2)
+
+    def load_users_db(self):
+        """بارگذاری دیتابیس کاربران"""
+        try:
+            with open(USERS_DB, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+
+    def save_users_db(self):
+        """ذخیره دیتابیس کاربران"""
+        with open(USERS_DB, 'w', encoding="utf-8") as f:
+            json.dump(self.users_db, f, ensure_ascii=False, indent=2)
+
+    def add_user(self, user_id, username):
+        """اضافه کردن کاربر به دیتابیس"""
+        if str(user_id) not in self.users_db:
+            self.users_db[str(user_id)] = {'username': username, 'join_date': datetime.now().isoformat()}
+            self.save_users_db()
+
+    def add_file(self, file_id, file_info):
+        """اضافه کردن فایل به دیتابیس"""
+        unique_id = hashlib.md5(f"{file_id}{datetime.now()}".encode()).hexdigest()[:12]
+
+        self.files_db[unique_id] = {
+            'file_id': file_id,
+            'file_name': file_info['file_name'],
+            'file_size': file_info['file_size'],
+            'file_type': file_info['file_type'],
+            'upload_date': datetime.now().isoformat(),
+            'uploader_id': file_info['uploader_id'],
+            'download_count': 0,
+            'file_path': file_info['file_path'] # اضافه کردن مسیر فایل
+        }
+
+        self.save_files_db()
+        return unique_id
+
+    def get_file(self, unique_id):
+        """دریافت اطلاعات فایل"""
+        return self.files_db.get(unique_id)
+
+    def delete_file(self, unique_id):
+        """حذف فایل از دیتابیس"""
+        if unique_id in self.files_db:
+            # حذف فایل فیزیکی
+            file_path = self.files_db[unique_id].get('file_path')
+            # توجه: اگر file_path لینک گوگل درایو است، نیازی به حذف فیزیکی نیست.
+            # اگر در آینده نیاز به حذف فایل از درایو بود، باید API گوگل درایو استفاده شود.
+
+            del self.files_db[unique_id]
+            self.save_files_db()
+            return True
+        return False
+
+    def increment_download(self, unique_id):
+        """افزایش تعداد دانلود"""
+        if unique_id in self.files_db:
+            self.files_db[unique_id]['download_count'] += 1
+            self.save_files_db()
+
+# ایجاد نمونه مدیر فایل
+file_manager = FileManager()
+
+def is_admin(user_id):
+    """بررسی ادمین بودن کاربر"""
+    return user_id in ADMIN_IDS
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    file_manager.add_user(user.id, user.username or "") # اضافه کردن کاربر به دیتابیس
+
+    # بررسی آرگومان start (مثلاً get_xxxxx)
+    if context.args:
+        arg = context.args[0]
+        if arg.startswith("get_"):
+            unique_id = arg[4:]
+            file_info = file_manager.get_file(unique_id)
+
+            if not file_info:
+                await update.message.reply_text("❌ فایل یافت نشد یا حذف شده است!")
+                return
+
+            # ارسال فایل (در اینجا از لینک گوگل درایو استفاده می‌شود)
+            await send_file_from_drive(update, context, file_info, unique_id) # از تابع جدید استفاده کنید
+            return
+
+    # پیام خوش‌آمد معمولی
+    keyboard = [
+        [InlineKeyboardButton("📤 آپلود فایل", callback_data="upload_file")],
+        [InlineKeyboardButton("🗑️ حذف فایل", callback_data="delete_file")],
+        [InlineKeyboardButton("📊 آمار فایل‌ها", callback_data="file_stats")]
+    ]
+    if is_admin(user.id):
+         keyboard.append([InlineKeyboardButton("📢 ارسال پیام همگانی", callback_data="broadcast")])
+
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    await update.message.reply_text(
+        f"سلام {user.first_name}! ✨\nبه ربات خوش اومدی.",
+        reply_markup=reply_markup
+    )
+
+
+async def send_file_from_drive(update: Update, context: ContextTypes.DEFAULT_TYPE, file_info: dict, unique_id: str):
+    """ارسال فایل به کاربر از لینک گوگل درایو"""
+    try:
+        caption = f"""
+📁 {file_info['file_name']}
+📅 آپلود: {datetime.fromisoformat(file_info['upload_date']).strftime('%Y/%m/%d')}
+📥 دانلود: {file_info['download_count'] + 1}
+"""
+        google_drive_link = file_info.get('file_path')
+
+        if not google_drive_link or not google_drive_link.startswith("https://drive.google.com/uc?id="):
+             await update.message.reply_text("❌ لینک دانلود فایل نامعتبر است!")
+             logger.error(f"لینک گوگل درایو نامعتبر برای فایل {unique_id}: {google_drive_link}")
+             return
+
+        # تلگرام می‌تواند فایل را مستقیماً از لینک گوگل درایو دانلود کند
+        await context.bot.send_document(
+            chat_id=update.effective_chat.id,
+            document=google_drive_link,
+            caption=caption
+        )
+
+        # افزایش شمارنده دانلود
+        file_manager.increment_download(unique_id)
+
+        logger.info(f"فایل دانلود شد: {unique_id} توسط {update.effective_user.id}")
+
+    except Exception as e:
+        await update.message.reply_text("❌ خطا در ارسال فایل! ممکن است فایل حذف شده باشد.")
+        logger.error(f"خطا در ارسال فایل {unique_id}: {e}")
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """پردازش دکمه‌های inline"""
+    query = update.callback_query
+    await query.answer()
+
+    user_id = query.from_user.id
+
+    if not is_admin(user_id):
+        await query.edit_message_text("❌ شما دسترسی ادمین ندارید!")
+        return
+
+    if query.data == 'upload_file':
+        await query.edit_message_text("""
+📤 آپلود فایل:
+
+📋 مراحل آپلود:
+1️⃣ فایل مورد نظر را ارسال کنید
+2️⃣ ربات لینک مستقیم را ارسال می‌کند
+3️⃣ لینک را در کانال قرار دهید
+
+💡 انواع فایل پشتیبانی شده:
+• ویدیو (MP4, AVI, MKV)
+• صوت (MP3, WAV, FLAC)
+• تصویر (JPG, PNG, GIF)
+• سند (PDF, DOC, ZIP)
+
+👇 فایل خود را ارسال کنید:
+""")
+
+        context.user_data['waiting_for_file'] = True
+
+    elif query.data == 'delete_file':
+        files_list = ""
+        if file_manager.files_db:
+            files_list = "🗂️ فایل‌های موجود:\n\n"
+            for unique_id, file_info in file_manager.files_db.items():
+                upload_date = datetime.fromisoformat(file_info['upload_date']).strftime('%Y/%m/%d')
+                files_list += f"🔹 {file_info['file_name']}\n"
+                files_list += f"   📅 {upload_date} | 📥 {file_info['download_count']} دانلود\n"
+                files_list += f"   🆔 کد: {unique_id}\n\n"
+
+            files_list += "💡 برای حذف، کد فایل را ارسال کنید:"
+        else:
+            files_list = "❌ هیچ فایلی موجود نیست!"
+
+        await query.edit_message_text(files_list)
+        context.user_data['waiting_for_delete'] = True
+
+    elif query.data == 'file_stats':
+        if not file_manager.files_db:
+            await query.edit_message_text("📊 هیچ فایلی آپلود نشده است!")
+            return
+
+        total_files = len(file_manager.files_db)
+        total_downloads = sum(f['download_count'] for f in file_manager.files_db.values())
+
+        # آمار بر اساس نوع فایل
+        file_types = {}
+        for file_info in file_manager.files_db.values():
+            file_type = file_info['file_type']
+            file_types[file_type] = file_types.get(file_type, 0) + 1
+
+        stats_text = f"""
+📊 آمار کامل فایل‌ها:
+
+📁 کل فایل‌ها: {total_files}
+📥 کل دانلودها: {total_downloads}
+📈 میانگین دانلود: {total_downloads/total_files:.1f}
+
+📋 آمار بر اساس نوع:
+"""
+
+        for file_type, count in file_types.items():
+            stats_text += f"• {file_type}: {count} فایل\n"
+
+        # محبوب‌ترین فایل‌ها
+        popular_files = sorted(
+            file_manager.files_db.items(),
+            key=lambda x: x[1]['download_count'],
+            reverse=True
+        )[:3]
+
+        if popular_files:
+            stats_text += "\n🔥 محبوب‌ترین فایل‌ها:\n"
+            for i, (unique_id, file_info) in enumerate(popular_files, 1):
+                stats_text += f"{i}. {file_info['file_name']} ({file_info['download_count']} دانلود)\n"
+
+        await query.edit_message_text(stats_text)
+
+    elif query.data == 'broadcast':
+        if is_admin(user_id):
+            await query.answer("📢 حالت ارسال همگانی فعال شد.")
+            return  # ConversationHandler خودش ادامه میده
+
+
+async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """پردازش فایل‌های ارسالی"""
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        await update.message.reply_text("❌ شما مجاز به آپلود فایل نیستید!")
+        return
+
+    if not context.user_data.get('waiting_for_file', False):
+        return
+
+    await update.message.reply_text("در حال پردازش فایل...")
+
+    # دریافت اطلاعات فایل
+    file_obj = None
+    file_name = ""
+    file_size = 0
+    file_type = ""
+
+    if update.message.document:
+        file_obj = update.message.document
+        file_name = file_obj.file_name or "document"
+        file_size = file_obj.file_size
+        file_type = "سند"
+    elif update.message.video:
+        file_obj = update.message.video
+        file_name = f"video_{file_obj.file_id[:8]}.mp4"
+        file_size = file_obj.file_size
+        file_type = "ویدیو"
+    elif update.message.audio:
+        file_obj = update.message.audio
+        file_name = file_obj.file_name or f"audio_{file_obj.file_id[:8]}.mp3"
+        file_size = file_obj.file_size
+        file_type = "صوت"
+    elif update.message.photo:
+        file_obj = update.message.photo[-1]  # بالاترین کیفیت
+        file_name = f"photo_{file_obj.file_id[:8]}.jpg"
+        file_size = file_obj.file_size
+        file_type = "تصویر"
+    else:
+        await update.message.reply_text("❌ نوع فایل پشتیبانی نمی‌شود!")
+        return
+
+    # ذخیره فیزیکی فایل در پوشه موقت
+    downloaded_file = await file_obj.get_file()
+    temp_file_path = os.path.join(FILES_DIR, file_name) # استفاده از FILES_DIR به عنوان پوشه موقت
+    await downloaded_file.download_to_drive(temp_file_path)
+
+    # آپلود به گوگل درایو
+    google_drive_link = None
+    try:
+        google_drive_link = upload_to_drive(temp_file_path, file_name)
+    except Exception as e:
+        await update.message.reply_text("❌ خطا در آپلود فایل به گوگل درایو!")
+        logger.error(f"خطا در آپلود به گوگل درایو: {e}")
+    finally:
+         # حذف فایل موقت بعد از آپلود یا خطا
+         if os.path.exists(temp_file_path):
+              os.remove(temp_file_path)
+
+    if not google_drive_link:
+        return # اگر آپلود به درایو موفق نبود، متوقف شود
+
+
+    # ثبت در دیتابیس (ذخیره لینک گوگل درایو به جای مسیر محلی)
+    file_info = {
+        'file_name': file_name,
+        'file_path': google_drive_link,   # ذخیره لینک گوگل درایو
+        'file_size': file_size,
+        'file_type': file_type,
+        'uploader_id': user_id
+    }
+    unique_id = file_manager.add_file(file_obj.file_id, file_info)
+
+    # تولید لینک مستقیم ربات
+    bot_username = context.bot.username
+    direct_link = f"https://t.me/{bot_username}?start=get_{unique_id}"
+
+
+    # فرمت حجم فایل
+    if file_size < 1024:
+        size_str = f"{file_size} بایت"
+    elif file_size < 1024 * 1024:
+        size_str = f"{file_size / 1024:.1f} کیلوبایت"
+    else:
+        size_str = f"{file_size / (1024 * 1024):.1f} مگابایت"
+
+    success_message = f"""
+✅ فایل با موفقیت آپلود شد!
+
+📁 نام فایل: {file_name}
+📊 حجم: {size_str}
+🏷️ نوع: {file_type}
+🆔 کد فایل: {unique_id}
+
+🔗 لینک مستقیم ربات:
+{direct_link}
+
+🔗 لینک گوگل درایو:
+{google_drive_link}
+
+📋 برای استفاده در کانال:
+دکمه با متن "دریافت فایل" و لینک ربات بسازید
+
+💡 کاربران با کلیک روی دکمه، فایل را دریافت می‌کنند
+"""
+
+    await update.message.reply_text(success_message)
+    context.user_data['waiting_for_file'] = False
+
+    logger.info(f"فایل آپلود شد و به گوگل درایو منتقل شد: {file_name} توسط {user_id}")
+
+async def handle_delete_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """پردازش درخواست حذف فایل"""
+    user_id = update.effective_user.id
+
+    if not is_admin(user_id):
+        return
+
+    if not context.user_data.get('waiting_for_delete', False):
+        return
+
+    file_code = update.message.text.strip()
+
+    if file_manager.delete_file(file_code):
+        await update.message.reply_text(f"✅ فایل با کد {file_code} حذف شد!")
+        logger.info(f"فایل حذف شد: {file_code} توسط {user_id}")
+    else:
+        await update.message.reply_text(f"❌ فایل با کد {file_code} یافت نشد!")
+
+    context.user_data['waiting_for_delete'] = False
+
+async def get_file_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """دستور دریافت فایل"""
+    if not context.args:
+        await update.message.reply_text("❌ کد فایل مشخص نشده!")
+        return
+
+    file_code = context.args[0]
+
+    # بررسی فرمت get_XXXXXX
+    if file_code.startswith('get_'):
+        unique_id = file_code[4:]  # حذف get_
+    else:
+        unique_id = file_code
+
+    file_info = file_manager.get_file(unique_id)
+
+    if not file_info:
+        await update.message.reply_text("❌ فایل یافت نشد یا حذف شده است!")
+        return
+
+    # ارسال فایل با استفاده از تابع جدید که از لینک گوگل درایو استفاده می‌کند
+    await send_file_from_drive(update, context, file_info, unique_id)
+
+
+# Broadcast functionality
+WAITING_BROADCAST = 1
+
+async def broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """شروع فرآیند ارسال پیام همگانی"""
+    # این تابع توسط ConversationHandler به عنوان entry_point فراخوانی می‌شود
+    # دسترسی ادمین قبلاً در button_handler بررسی شده، اما اینجا هم برای اطمینان می‌گذاریم
+    if not is_admin(update.effective_user.id):
+        await update.message.reply_text("❌ شما دسترسی ادمین ندارید!")
+        return ConversationHandler.END
+
+    await update.message.reply_text("📢 پیام موردنظر رو بفرست تا برای همه ارسال کنم.")
+    return WAITING_BROADCAST
+
+async def broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ارسال پیام به همه کاربران"""
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+
+    sent_count = 0
+    failed_count = 0
+
+    await update.message.reply_text("در حال ارسال پیام همگانی...")
+
+    # دریافت لیست user_id ها از دیتابیس کاربران
+    user_ids = list(file_manager.users_db.keys())
+
+    for user_id_str in user_ids:
+        user_id = int(user_id_str) # تبدیل به عدد برای استفاده در chat_id
+        try:
+            if update.message.text:
+                await context.bot.send_message(chat_id=user_id, text=update.message.text)
+            elif update.message.photo:
+                await context.bot.send_photo(chat_id=user_id, photo=update.message.photo[-1].file_id, caption=update.message.caption or "")
+            elif update.message.video:
+                await context.bot.send_video(chat_id=user_id, video=update.message.video.file_id, caption=update.message.caption or "")
+            elif update.message.document:
+                await context.bot.send_document(chat_id=user_id, document=update.message.document.file_id, caption=update.message.caption or "")
+            else:
+                 # اگر نوع پیام پشتیبانی نشود
+                 continue
+
+            sent_count += 1
+            await asyncio.sleep(0.1) # تاخیر کوچک برای جلوگیری از محدودیت rate limit
+
+        except Exception as e:
+            failed_count += 1
+            logger.error(f"خطا در ارسال پیام همگانی به {user_id}: {e}")
+            # Optionally, you can remove the user from the database if sending fails consistently
+            # del file_manager.users_db[user_id_str]
+            # file_manager.save_users_db()
+
+
+    await update.message.reply_text(f"✅ پیام همگانی ارسال شد!\nارسال موفق: {sent_count}\nارسال ناموفق: {failed_count}")
+    context.user_data.pop('waiting_for_broadcast', None) # حذف حالت انتظار
+    return ConversationHandler.END
+
+async def broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """لغو فرآیند ارسال پیام همگانی"""
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    await update.message.reply_text("❌ ارسال پیام همگانی لغو شد.")
+    context.user_data.pop('waiting_for_broadcast', None) # حذف حالت انتظار
+    return ConversationHandler.END
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """پردازش پیام‌های متنی"""
+    user_id = update.effective_user.id
+
+    # بررسی درخواست حذف فایل
+    if is_admin(user_id) and context.user_data.get('waiting_for_delete', False):
+        await handle_delete_request(update, context)
+        return
+
+    # بررسی درخواست ارسال پیام همگانی
+    # این پیام توسط هندلر ConversationHandler پردازش می‌شود، پس اینجا نیازی به پردازش نیست
+
+
+    # پیام عادی
+    if is_admin(user_id):
+        await update.message.reply_text("👑 از دکمه‌های منو استفاده کنید یا /start بزنید")
+    else:
+        await update.message.reply_text("💡 برای دریافت فایل از لینک‌های کانال استفاده کنید")
+
+import nest_asyncio
+import asyncio
+from pydrive2.auth import GoogleAuth
+from pydrive2.drive import GoogleDrive
+
+# اتصال به گوگل درایو
+# اطمینان از وجود فایل credentials.json در پوشه Colab
+# اگر اولین بار است، مرورگر برای احراز هویت باز می‌شود
+drive = None # Initialize drive to None
+try:
+    gauth = GoogleAuth()
+    # برای Colab، از WebServerAuth استفاده کنید و دستورالعمل‌ها را دنبال کنید
+    gauth.LocalWebserverAuth()
+    drive = GoogleDrive(gauth)
+except Exception as e:
+    logger.error(f"خطا در اتصال به گوگل درایو: {e}")
+    # می‌توانید ربات را متوقف کنید یا بدون قابلیت آپلود به درایو ادامه دهید
+
+
+def upload_to_drive(local_path, filename):
+    """آپلود فایل در گوگل درایو و گرفتن لینک دانلود"""
+    if drive is None:
+        logger.error("گوگل درایو متصل نیست!")
+        return None
+    try:
+        file_drive = drive.CreateFile({'title': filename})
+        file_drive.SetContentFile(local_path)
+        file_drive.Upload()
+        # گرفتن لینک اشتراک‌گذاری عمومی
+        file_drive.InsertPermission({'type': 'anyone', 'value': 'anyone', 'role': 'reader'})
+        logger.info(f"فایل {filename} در گوگل درایو آپلود شد: {file_drive['id']}")
+        return f"https://drive.google.com/uc?id={file_drive['id']}"
+    except Exception as e:
+        logger.error(f"خطا در آپلود فایل {filename} به گوگل درایو: {e}")
+        return None
+
+
+nest_asyncio.apply()  # برای جلوگیری از خطای event loop در Colab/Jupyter
+
+async def main():
+    application = Application.builder().token(BOT_TOKEN).build()
+
+    # هندلرها
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("get", get_file_command))
+    application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(MessageHandler(
+        filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.PHOTO,
+        handle_file
+    ))
+    # application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)) # این هندلر با ConversationHandler تداخل دارد
+
+    # ConversationHandler برای ارسال پیام همگانی
+    broadcast_handler = ConversationHandler(
+        entry_points=[CallbackQueryHandler(broadcast_start, pattern='^broadcast$')],
+        states={
+            WAITING_BROADCAST: [MessageHandler(filters.ALL & ~filters.COMMAND, broadcast_send)],
+        },
+        fallbacks=[CommandHandler("cancel", broadcast_cancel)],
+        # اطمینان از اینکه فقط ادمین‌ها می‌توانند این گفتگو را شروع کنند
+        # filter=filters.User(user_id=ADMIN_IDS) # فیلتر کردن بر اساس آیدی ادمین‌ها
+        allow_reentry=True # اجازه ورود مجدد به گفتگو در صورت قطع شدن
+    )
+    application.add_handler(broadcast_handler)
+
+    # اضافه کردن هندلر پیام متنی عادی بعد از ConversationHandler
+    # این هندلر فقط پیام‌هایی را پردازش می‌کند که توسط ConversationHandler یا سایر هندلرهای بالا پردازش نشده‌اند.
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+
+    logger.info("🚀 ربات مدیریت فایل شروع شد...")
+    print("🤖 ربات آماده است! Ctrl+C برای توقف")
+    print(f"👑 ادمین‌ها: {ADMIN_IDS}")
+
+    # اجرای async
+    await application.run_polling(drop_pending_updates=True)
+
+# برای Colab / Jupyter:
+await main()
